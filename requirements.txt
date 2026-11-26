@@ -1,4 +1,4 @@
 requests
 playwright
 playwright-stealth
-google-auth
+firebase-admin
