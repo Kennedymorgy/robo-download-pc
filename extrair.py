@@ -3,14 +3,9 @@ import re
 import sys
 import json
 from urllib.parse import urlparse, urljoin
-import requests
+import firebase_admin
+from firebase_admin import credentials, db
 from playwright.sync_api import sync_playwright
-
-try:
-    from google.oauth2 import service_account
-    import google.auth.transport.requests
-except ImportError:
-    service_account = None
 
 try:
     from playwright_stealth import stealth_sync
@@ -25,22 +20,17 @@ FIREBASE_CREDENTIALS_JSON = os.environ.get("FIREBASE_CREDENTIALS_JSON")
 ARQUIVO_JOGOS = "jogos.txt"
 
 
-def obter_token_firebase():
-    """Gera token OAuth2 usando a Service Account salva no GitHub Secrets."""
-    if not FIREBASE_CREDENTIALS_JSON or not service_account:
-        return None
-    try:
+def obter_ref_firebase(id_jogo):
+    """Inicializa o Firebase Admin SDK e retorna a referência /jogos/{id_jogo}."""
+    if not FIREBASE_CREDENTIALS_JSON:
+        raise RuntimeError("FIREBASE_CREDENTIALS_JSON não configurado nos Secrets do GitHub.")
+
+    if not firebase_admin._apps:
         info = json.loads(FIREBASE_CREDENTIALS_JSON)
-        scopes = [
-            "https://www.googleapis.com/auth/firebase.database",
-            "https://www.googleapis.com/auth/userinfo.email",
-        ]
-        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
-        creds.refresh(google.auth.transport.requests.Request())
-        return creds.token
-    except Exception as e:
-        print(f"⚠️ Erro ao gerar token Firebase: {e}")
-        return None
+        cred = credentials.Certificate(info)
+        firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
+
+    return db.reference(f"jogos/{id_jogo}")
 
 
 def gerar_id_jogo(url_origem):
@@ -81,7 +71,9 @@ def separar_versao_e_extra(texto_raw):
     for pat in padroes_extra:
         for achado in re.findall(pat, texto, flags=re.IGNORECASE):
             limpo = re.sub(r"\s+", " ", achado).strip()
-            if limpo and not limpo.startswith("+") and ("multiplayer" in limpo.lower() or "dlc" in limpo.lower() or "online" in limpo.lower() or "co-op" in limpo.lower() or "co-op" in limpo.lower()):
+            if limpo and not limpo.startswith("+") and any(
+                k in limpo.lower() for k in ("multiplayer", "dlc", "online", "co-op", "coop")
+            ):
                 limpo = "+ " + limpo
             if limpo.lower() not in [x.lower() for x in extras]:
                 extras.append(limpo)
@@ -239,7 +231,6 @@ def extrair_dados_steamrip(url_alvo):
             page.goto(url_alvo, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_timeout(4500)
 
-            # 1. Título completo (H1 ou og:title) para separar versão e extra
             titulo_completo = ""
             try:
                 h1 = page.locator("h1").first
@@ -267,7 +258,6 @@ def extrair_dados_steamrip(url_alvo):
             resultado["versao"] = versao
             resultado["extra"] = extra
 
-            # 2. Foto / Capa do jogo
             foto_url = ""
             try:
                 og_img = page.locator('meta[property="og:image"]').first
@@ -281,9 +271,7 @@ def extrair_dados_steamrip(url_alvo):
                     imgs = page.eval_on_selector_all(
                         "article img, .entry-content img, main img, img",
                         """els => els.map(e => ({
-                            src: e.getAttribute('src') || e.getAttribute('data-src') || '',
-                            w: e.naturalWidth || e.width || 0,
-                            h: e.naturalHeight || e.height || 0
+                            src: e.getAttribute('src') || e.getAttribute('data-src') || ''
                         }))""",
                     )
                     for item in imgs:
@@ -297,7 +285,6 @@ def extrair_dados_steamrip(url_alvo):
             if foto_url:
                 resultado["foto"] = urljoin(url_alvo, foto_url)
 
-            # 3. Coletar links de download (focando na seção principal antes de 'Update Only' se houver)
             candidatos = page.evaluate(
                 """() => {
                     const out = [];
@@ -355,20 +342,6 @@ def extrair_dados_steamrip(url_alvo):
     return resultado
 
 
-def buscar_jogo_firebase(id_jogo, token=None):
-    """Consulta os dados atuais de /jogos/{id_jogo}.json no Firebase PC."""
-    url = f"{FIREBASE_DB_URL}/jogos/{id_jogo}.json"
-    params = {"auth": token} if token else {}
-    try:
-        res = requests.get(url, params=params, timeout=20)
-        if res.status_code == 200 and res.text and res.text != "null":
-            dados = res.json()
-            return dados if isinstance(dados, dict) else {}
-    except Exception as e:
-        print(f"⚠️ Erro ao ler Firebase para '{id_jogo}': {e}")
-    return {}
-
-
 def salvar_jogo_firebase(dados_novos):
     """Salva ou atualiza /jogos/{id}.json no Firebase PC apenas se houver mudança real."""
     id_jogo = dados_novos["id"]
@@ -376,50 +349,43 @@ def salvar_jogo_firebase(dados_novos):
         print(f"⚠️ Nenhum link de download encontrado para '{id_jogo}'. Nada enviado ao Firebase.")
         return False
 
-    token = obter_token_firebase()
-    if not token:
-        print("❌ FIREBASE_CREDENTIALS_JSON ausente ou inválido. Configure nos Secrets do GitHub.")
-        return False
-
-    atual = buscar_jogo_firebase(id_jogo, token=token)
-
-    mesmo_nome = atual.get("nome") == dados_novos.get("nome")
-    mesma_versao = atual.get("versao") == dados_novos.get("versao")
-    mesmo_extra = atual.get("extra") == dados_novos.get("extra")
-    mesma_foto = atual.get("foto") == dados_novos.get("foto")
-    mesmos_links = atual.get("links") == dados_novos.get("links")
-
-    if mesmo_nome and mesma_versao and mesmo_extra and mesma_foto and mesmos_links:
-        print(f"⏩ '{id_jogo}' sem alterações ({dados_novos.get('versao') or 'sem versão'}).")
-        return True
-
-    payload = {
-        "id": id_jogo,
-        "nome": dados_novos["nome"],
-        "versao": dados_novos["versao"],
-        "extra": dados_novos["extra"],
-        "foto": dados_novos["foto"],
-        "links": dados_novos["links"],
-        "url_origem": dados_novos["url_origem"],
-        "fonte": "steamrip",
-    }
-
-    url = f"{FIREBASE_DB_URL}/jogos/{id_jogo}.json"
     try:
-        res = requests.put(url, params={"auth": token}, json=payload, timeout=25)
-        if res.status_code == 200:
-            print(
-                f"✅ Firebase PC atualizado -> ID: {id_jogo} | "
-                f"Versão: {payload['versao'] or '-'} | "
-                f"Extra: {payload['extra'] or '-'} | "
-                f"Links: {len(payload['links'])}"
-            )
+        ref = obter_ref_firebase(id_jogo)
+        atual = ref.get() or {}
+        if not isinstance(atual, dict):
+            atual = {}
+
+        mesmo_nome = atual.get("nome") == dados_novos.get("nome")
+        mesma_versao = atual.get("versao") == dados_novos.get("versao")
+        mesmo_extra = atual.get("extra") == dados_novos.get("extra")
+        mesma_foto = atual.get("foto") == dados_novos.get("foto")
+        mesmos_links = atual.get("links") == dados_novos.get("links")
+
+        if mesmo_nome and mesma_versao and mesmo_extra and mesma_foto and mesmos_links:
+            print(f"⏩ '{id_jogo}' sem alterações ({dados_novos.get('versao') or 'sem versão'}).")
             return True
-        else:
-            print(f"❌ Erro HTTP ao salvar no Firebase ({res.status_code}): {res.text}")
-            return False
+
+        payload = {
+            "id": id_jogo,
+            "nome": dados_novos["nome"],
+            "versao": dados_novos["versao"],
+            "extra": dados_novos["extra"],
+            "foto": dados_novos["foto"],
+            "links": dados_novos["links"],
+            "url_origem": dados_novos["url_origem"],
+            "fonte": "steamrip",
+        }
+
+        ref.set(payload)
+        print(
+            f"✅ Firebase PC atualizado -> ID: {id_jogo} | "
+            f"Versão: {payload['versao'] or '-'} | "
+            f"Extra: {payload['extra'] or '-'} | "
+            f"Links: {len(payload['links'])}"
+        )
+        return True
     except Exception as e:
-        print(f"❌ Exceção ao salvar no Firebase: {e}")
+        print(f"❌ Erro ao salvar no Firebase: {e}")
         return False
 
 
