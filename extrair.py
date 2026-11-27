@@ -17,6 +17,7 @@ FIREBASE_DB_URL = (
     or "https://k404repacks-pc-default-rtdb.firebaseio.com"
 ).rstrip("/")
 FIREBASE_CREDENTIALS_JSON = os.environ.get("FIREBASE_CREDENTIALS_JSON")
+FORCE_UPDATE = os.environ.get("FORCE_UPDATE", "").strip().lower() in ("1", "true", "yes")
 ARQUIVO_JOGOS = "jogos.txt"
 
 
@@ -163,13 +164,16 @@ def identificar_nome_host(url, rotulo_proximo=""):
         return "Mirror"
 
 
-def url_e_host_de_download(url, rotulo=""):
-    """Filtra URLs válidas de download e descarta links quebrados, de erro ou anúncios."""
+def parece_url_arquivo_valida(url, rotulo=""):
+    """
+    Verifica se a URL parece um destino real de arquivo/mirror/torrent
+    e não uma página inicial, erro ou anúncio.
+    """
     if not url or not url.startswith(("http://", "https://", "magnet:")):
         return False
 
     u = url.lower()
-    if "/error" in u or "referrer+not+allowed" in u or "not+found" in u:
+    if "/error" in u or "referrer+not+allowed" in u or "not+found" in u or "void" in u:
         return False
 
     ignorar = [
@@ -196,6 +200,12 @@ def url_e_host_de_download(url, rotulo=""):
     if u.startswith("magnet:") or "torrent" in u or "torrent" in (rotulo or "").lower():
         return True
 
+    parsed = urlparse(url)
+    caminho = (parsed.path or "").strip("/")
+    # Evita cair apenas na raiz do domínio (ex.: https://bzzhr.to/ ou https://megadb.net/)
+    if not caminho and not parsed.query:
+        return False
+
     hosts_conhecidos = [
         "megadb",
         "gofile",
@@ -219,64 +229,89 @@ def url_e_host_de_download(url, rotulo=""):
     return any(h in u for h in hosts_conhecidos)
 
 
-def resolver_destino_real(context, page, url_candidata, indice_link):
-    """
-    Tenta resolver redirecionamentos ou clicar no botão correspondente para obter a URL final
-    sem cair em páginas de erro ou abas de anúncio.
-    """
-    url_limpa = (url_candidata or "").strip()
-    if not url_limpa:
+def extrair_url_de_onclick(onclick_str, base_url):
+    """Extrai URL de dentro de atributos onclick como window.open('https://...') ou location.href='...'."""
+    if not onclick_str:
         return ""
+    m = re.search(r"""(?:window\.open|location\.href|location\.assign|open)\s*\(\s*['"]([^'"]+)['"]""", onclick_str, flags=re.IGNORECASE)
+    if m:
+        return urljoin(base_url, m.group(1).strip())
+    m2 = re.search(r"""https?://[^\s'"]+""", onclick_str, flags=re.IGNORECASE)
+    if m2:
+        return m2.group(0).strip()
+    return ""
 
-    # Se já for URL direta limpa de host conhecido e não tiver /error, mantém
-    if url_e_host_de_download(url_limpa) and "/error" not in url_limpa.lower():
-        return url_limpa
 
-    # Tenta clicar no botão/link correspondente na página para ver se abre URL real ou nova aba
+def resolver_clique_elemento(context, page, selector_idx, url_base):
+    """
+    Clica no elemento candidato para capturar URL aberta em nova aba (popup)
+    ou navegação, fechando abas de anúncio que não sejam hosts válidos.
+    """
     try:
-        anchors = page.locator("article a[href], .entry-content a[href], main a[href]")
-        total = anchors.count()
-        alvo_idx = None
-        for i in range(total):
-            h = (anchors.nth(i).get_attribute("href") or "").strip()
-            if h and urljoin(page.url, h) == url_limpa:
-                alvo_idx = i
-                break
+        itens = page.locator("article a, article button, .entry-content a, .entry-content button, main a, main button")
+        if selector_idx < 0 or selector_idx >= itens.count():
+            return ""
 
-        if alvo_idx is not None:
-            antes_paginas = len(context.pages)
+        el = itens.nth(selector_idx)
+        antes_paginas = list(context.pages)
+        url_antes = page.url
+
+        popup_url = ""
+        try:
+            with context.expect_page(timeout=3500) as popup_info:
+                el.click(timeout=4000)
+            nova_aba = popup_info.value
             try:
-                anchors.nth(alvo_idx).click(timeout=4000)
+                nova_aba.wait_for_load_state("domcontentloaded", timeout=6000)
+                popup_url = nova_aba.url or ""
+            except Exception:
+                popup_url = nova_aba.url or ""
+            finally:
+                try:
+                    if nova_aba != page:
+                        nova_aba.close()
+                except Exception:
+                    pass
+        except Exception:
+            try:
+                el.click(timeout=4000)
                 page.wait_for_timeout(1500)
             except Exception:
                 pass
 
-            # Fecha abas extras abertas (geralmente anúncios) e pega URL válida se houver
-            url_encontrada = ""
-            for p_extra in list(context.pages)[antes_paginas:]:
+        # Fecha quaisquer outras abas extras abertas por scripts/anúncios
+        for p_extra in list(context.pages):
+            if p_extra not in antes_paginas and p_extra != page:
                 try:
-                    u_extra = p_extra.url or ""
-                    if url_e_host_de_download(u_extra) and "/error" not in u_extra.lower():
-                        url_encontrada = u_extra
+                    if not popup_url and p_extra.url:
+                        popup_url = p_extra.url
                 except Exception:
                     pass
-                finally:
-                    try:
-                        if p_extra != page:
-                            p_extra.close()
-                    except Exception:
-                        pass
+                try:
+                    p_extra.close()
+                except Exception:
+                    pass
 
-            if url_encontrada:
-                return url_encontrada
+        if popup_url and parece_url_arquivo_valida(popup_url):
+            return popup_url
+
+        if page.url and page.url != url_antes and parece_url_arquivo_valida(page.url):
+            destino_final = page.url
+            try:
+                page.go_back(wait_until="domcontentloaded", timeout=8000)
+                page.wait_for_timeout(1200)
+            except Exception:
+                pass
+            return destino_final
+
     except Exception:
         pass
 
-    return url_limpa
+    return ""
 
 
 def extrair_dados_steamrip(url_alvo):
-    """Abre a página no SteamRIP e extrai metadados e links válidos."""
+    """Abre a página no SteamRIP e extrai metadados e links válidos de download."""
     print(f"🔎 Extraindo SteamRIP: {url_alvo}")
     id_jogo = gerar_id_jogo(url_alvo)
     nome_padrao = id_jogo.replace("-", " ").title()
@@ -396,18 +431,20 @@ def extrair_dados_steamrip(url_alvo):
                 """() => {
                     const out = [];
                     const root = document.querySelector('article, .entry-content, .post-content, main') || document.body;
-                    const anchors = Array.from(root.querySelectorAll('a[href]'));
+                    const els = Array.from(root.querySelectorAll('a, button'));
 
-                    for (const a of anchors) {
-                        const href = (a.getAttribute('href') || '').trim();
-                        if (!href || href.startsWith('#') || href.toLowerCase().startsWith('javascript:')) continue;
+                    els.forEach((el, idx) => {
+                        const href = (el.getAttribute('href') || '').trim();
+                        const dataHref = (el.getAttribute('data-href') || el.getAttribute('data-url') || el.getAttribute('data-link') || '').trim();
+                        const onclick = (el.getAttribute('onclick') || '').trim();
+                        const textoProprio = (el.innerText || el.textContent || '').trim();
 
                         let rotulo = '';
-                        let cursor = a.previousElementSibling;
+                        let cursor = el.previousElementSibling;
                         let passos = 0;
                         while (cursor && passos < 3) {
                             const txt = (cursor.innerText || cursor.textContent || '').trim();
-                            if (txt && !/^(download here|click here|get link)$/i.test(txt)) {
+                            if (txt && !/^(download here|click here|get link|torrent)$/i.test(txt)) {
                                 rotulo = txt;
                                 break;
                             }
@@ -415,12 +452,12 @@ def extrair_dados_steamrip(url_alvo):
                             passos++;
                         }
 
-                        if (!rotulo && a.parentElement) {
-                            let pCursor = a.parentElement.previousElementSibling;
+                        if (!rotulo && el.parentElement) {
+                            let pCursor = el.parentElement.previousElementSibling;
                             let pPassos = 0;
                             while (pCursor && pPassos < 3) {
                                 const txt = (pCursor.innerText || pCursor.textContent || '').trim();
-                                if (txt && !/^(download here|click here|get link)$/i.test(txt)) {
+                                if (txt && !/^(download here|click here|get link|torrent)$/i.test(txt)) {
                                     rotulo = txt;
                                     break;
                                 }
@@ -429,12 +466,15 @@ def extrair_dados_steamrip(url_alvo):
                             }
                         }
 
-                        const textoProprio = (a.innerText || a.textContent || '').trim();
                         out.push({
+                            idx: idx,
                             href: href,
-                            rotulo: rotulo || textoProprio
+                            dataHref: dataHref,
+                            onclick: onclick,
+                            rotulo: rotulo || textoProprio,
+                            textoProprio: textoProprio
                         });
-                    }
+                    });
                     return out;
                 }"""
             )
@@ -446,14 +486,20 @@ def extrair_dados_steamrip(url_alvo):
                 if len(links_dict) >= 6:
                     break
 
-                href_abs = urljoin(url_alvo, item.get("href") or "")
                 rotulo = item.get("rotulo") or ""
+                texto_bot = (item.get("textoProprio") or "").lower()
+                raw_cand = item.get("href") or item.get("dataHref") or extrair_url_de_onclick(item.get("onclick") or "", url_alvo)
+                href_abs = urljoin(url_alvo, raw_cand) if raw_cand else ""
 
-                if not url_e_host_de_download(href_abs, rotulo):
-                    continue
+                eh_botao_download = bool(re.search(r"\b(download\s*here|torrent|get\s*link)\b", f"{texto_bot} {rotulo}", flags=re.IGNORECASE))
 
-                destino = resolver_destino_real(context, page, href_abs, idx_extra)
-                if not url_e_host_de_download(destino, rotulo):
+                destino = ""
+                if href_abs and parece_url_arquivo_valida(href_abs, rotulo):
+                    destino = href_abs
+                elif eh_botao_download:
+                    destino = resolver_clique_elemento(context, page, item.get("idx", -1), url_alvo)
+
+                if not destino or not parece_url_arquivo_valida(destino, rotulo):
                     continue
 
                 nome_host = identificar_nome_host(destino, rotulo)
@@ -476,7 +522,7 @@ def extrair_dados_steamrip(url_alvo):
 
 
 def salvar_jogo_firebase(dados_novos):
-    """Salva ou atualiza /jogos/{id}.json no Firebase PC apenas se houver mudança real."""
+    """Salva ou atualiza /jogos/{id}.json no Firebase PC apenas se houver mudança real (ou FORCE_UPDATE)."""
     id_jogo = dados_novos["id"]
     if not dados_novos.get("links"):
         print(f"⚠️ Nenhum link de download válido encontrado para '{id_jogo}'. Nada enviado ao Firebase.")
@@ -495,7 +541,7 @@ def salvar_jogo_firebase(dados_novos):
         mesma_foto = atual.get("foto") == dados_novos.get("foto")
         mesmos_links = atual.get("links") == dados_novos.get("links")
 
-        if mesmo_nome and mesma_versao and mesmo_extra and mesmo_tamanho and mesma_foto and mesmos_links:
+        if not FORCE_UPDATE and mesmo_nome and mesma_versao and mesmo_extra and mesmo_tamanho and mesma_foto and mesmos_links:
             print(f"⏩ '{id_jogo}' sem alterações ({dados_novos.get('versao') or 'sem versão'}).")
             return True
 
@@ -552,8 +598,12 @@ def processar_url(url_alvo):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1].strip().startswith("http"):
-        processar_url(sys.argv[1].strip())
+    args = [a for a in sys.argv[1:] if a != "--force"]
+    if "--force" in sys.argv[1:]:
+        FORCE_UPDATE = True
+
+    if args and args[0].strip().startswith("http"):
+        processar_url(args[0].strip())
     elif os.path.exists(ARQUIVO_JOGOS):
         with open(ARQUIVO_JOGOS, "r", encoding="utf-8") as f:
             urls = [linha.strip() for linha in f if linha.strip() and not linha.strip().startswith("#")]
