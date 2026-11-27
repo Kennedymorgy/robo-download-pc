@@ -23,7 +23,6 @@ ARQUIVO_JOGOS = "jogos.txt"
 
 
 def obter_ref_firebase(id_jogo):
-    """Inicializa o Firebase Admin SDK e retorna a referência /jogos/{id_jogo}."""
     if not FIREBASE_CREDENTIALS_JSON:
         raise RuntimeError("FIREBASE_CREDENTIALS_JSON não configurado nos Secrets do GitHub.")
 
@@ -36,7 +35,6 @@ def obter_ref_firebase(id_jogo):
 
 
 def gerar_id_jogo(url_origem):
-    """Gera um ID limpo e consistente a partir do slug da URL."""
     path = urlparse(url_origem).path.strip("/")
     slug = path.split("/")[-1] if path else "jogo-pc"
     slug = re.sub(r"\.(html|php)$", "", slug, flags=re.IGNORECASE).lower()
@@ -45,7 +43,6 @@ def gerar_id_jogo(url_origem):
 
 
 def extrair_versao_exata(titulo_completo, texto_corpo):
-    """Extrai a versão principal do jogo priorizando o campo Version: da página."""
     for fonte in [texto_corpo or "", titulo_completo or ""]:
         m_rotulo = re.search(
             r"(?:^|\n|\s)version\s*[:\-]\s*v?(\d+(?:\.\d+){1,4})",
@@ -67,7 +64,6 @@ def extrair_versao_exata(titulo_completo, texto_corpo):
 
 
 def separar_extra(texto_raw):
-    """Extrai extras/edições (ex.: + Multiplayer, + All DLCs, + all add-ons)."""
     texto = (texto_raw or "").strip()
     extras = []
 
@@ -99,7 +95,6 @@ def separar_extra(texto_raw):
 
 
 def extrair_tamanho_jogo(texto_corpo):
-    """Extrai o peso/tamanho do jogo (ex.: 8.28 GB)."""
     if not texto_corpo:
         return ""
     m = re.search(
@@ -113,7 +108,6 @@ def extrair_tamanho_jogo(texto_corpo):
 
 
 def limpar_nome_jogo(titulo_raw):
-    """Extrai apenas o nome base do jogo."""
     t = (titulo_raw or "").strip()
     t = re.sub(r"\s*[\|\-–—]\s*SteamRIP.*$", "", t, flags=re.IGNORECASE).strip()
     t = re.sub(r"\s*Free\s*Download.*$", "", t, flags=re.IGNORECASE).strip()
@@ -124,7 +118,6 @@ def limpar_nome_jogo(titulo_raw):
 
 
 def identificar_nome_host(url, rotulo_proximo=""):
-    """Identifica o nome real do host com base na URL e no rótulo do botão."""
     u = (url or "").lower()
     rot = (rotulo_proximo or "").strip()
 
@@ -166,10 +159,6 @@ def identificar_nome_host(url, rotulo_proximo=""):
 
 
 def parece_url_arquivo_valida(url, rotulo=""):
-    """
-    Valida se a URL é um destino real de arquivo/mirror/torrent
-    e rejeita páginas de erro, bloqueio de referrer ou raiz de site.
-    """
     if not url or not url.startswith(("http://", "https://", "magnet:")):
         return False
 
@@ -236,7 +225,6 @@ def parece_url_arquivo_valida(url, rotulo=""):
 
 
 def extrair_url_de_onclick(onclick_str, base_url):
-    """Extrai URL de dentro de atributos onclick como window.open('https://...') ou location.href='...'."""
     if not onclick_str:
         return ""
     m = re.search(
@@ -252,11 +240,62 @@ def extrair_url_de_onclick(onclick_str, base_url):
     return ""
 
 
-def resolver_clique_com_paciencia(context, page, selector_idx, url_base, urls_observadas_rede):
+def seguir_redirecionamento_real(context, page, url_inicial, url_base):
     """
-    Clica no botão/link e aguarda com calma para capturar URL real
-    em nova aba, redirecionamento ou tráfego de rede, fechando abas de anúncio.
+    Abre a URL candidata num contexto com Referer do SteamRIP, espera redirecionamentos
+    e anúncios/popups, e devolve a URL final limpa do host de download (ou vazio se falhar).
     """
+    if not url_inicial or not parece_url_arquivo_valida(url_inicial):
+        return ""
+
+    aba_teste = None
+    antes_paginas = set(context.pages)
+    try:
+        aba_teste = context.new_page()
+        aba_teste.set_extra_http_headers({"Referer": url_base})
+        aba_teste.goto(url_inicial, wait_until="domcontentloaded", timeout=35000)
+
+        melhor_url = aba_teste.url or url_inicial
+        prazo = time.time() + 14.0
+
+        while time.time() < prazo:
+            aba_teste.wait_for_timeout(1000)
+
+            for p_extra in list(context.pages):
+                if p_extra not in antes_paginas and p_extra != aba_teste and p_extra != page:
+                    try:
+                        u_aba = p_extra.url or ""
+                        if parece_url_arquivo_valida(u_aba):
+                            melhor_url = u_aba
+                    except Exception:
+                        pass
+                    try:
+                        p_extra.close()
+                    except Exception:
+                        pass
+
+            try:
+                atual_u = aba_teste.url or ""
+                if parece_url_arquivo_valida(atual_u):
+                    melhor_url = atual_u
+            except Exception:
+                pass
+
+        if parece_url_arquivo_valida(melhor_url):
+            return melhor_url
+    except Exception:
+        pass
+    finally:
+        if aba_teste is not None:
+            try:
+                aba_teste.close()
+            except Exception:
+                pass
+
+    return url_inicial if parece_url_arquivo_valida(url_inicial) else ""
+
+
+def resolver_clique_elemento(context, page, selector_idx, url_base, urls_observadas_rede):
     try:
         itens = page.locator("article a, article button, .entry-content a, .entry-content button, main a, main button")
         if selector_idx < 0 or selector_idx >= itens.count():
@@ -277,8 +316,8 @@ def resolver_clique_com_paciencia(context, page, selector_idx, url_base, urls_ob
         except Exception:
             return ""
 
-        candidata_final = ""
-        prazo = time.time() + 16.0
+        candidata = ""
+        prazo = time.time() + 15.0
 
         while time.time() < prazo:
             page.wait_for_timeout(1000)
@@ -288,7 +327,7 @@ def resolver_clique_com_paciencia(context, page, selector_idx, url_base, urls_ob
                     try:
                         u_aba = p_extra.url or ""
                         if parece_url_arquivo_valida(u_aba):
-                            candidata_final = u_aba
+                            candidata = u_aba
                     except Exception:
                         pass
                     try:
@@ -297,38 +336,37 @@ def resolver_clique_com_paciencia(context, page, selector_idx, url_base, urls_ob
                     except Exception:
                         pass
 
-            if candidata_final:
+            if candidata:
                 break
 
             try:
                 if page.url and page.url != url_antes and parece_url_arquivo_valida(page.url):
-                    candidata_final = page.url
+                    candidata = page.url
                     break
             except Exception:
                 pass
 
             for u_net in urls_observadas_rede[inicio_rede:]:
                 if parece_url_arquivo_valida(u_net):
-                    candidata_final = u_net
+                    candidata = u_net
                     break
 
-            if candidata_final:
+            if candidata:
                 break
 
         try:
             if page.url != url_antes:
-                page.goto(url_base, wait_until="domcontentloaded", timeout=30000)
+                page.goto(url_base, wait_until="domcontentloaded", timeout=35000)
                 page.wait_for_timeout(2000)
         except Exception:
             pass
 
-        return candidata_final
+        return seguir_redirecionamento_real(context, page, candidata, url_base)
     except Exception:
         return ""
 
 
 def extrair_dados_steamrip(url_alvo):
-    """Abre a página no SteamRIP com paciência e extrai metadados e links válidos."""
     print(f"🔎 Extraindo SteamRIP: {url_alvo}")
     id_jogo = gerar_id_jogo(url_alvo)
     nome_padrao = id_jogo.replace("-", " ").title()
@@ -531,9 +569,9 @@ def extrair_dados_steamrip(url_alvo):
 
                 destino = ""
                 if href_abs and parece_url_arquivo_valida(href_abs, rotulo):
-                    destino = href_abs
+                    destino = seguir_redirecionamento_real(context, page, href_abs, url_alvo)
                 elif eh_botao_download:
-                    destino = resolver_clique_com_paciencia(
+                    destino = resolver_clique_elemento(
                         context, page, item.get("idx", -1), url_alvo, urls_observadas_rede
                     )
 
@@ -560,7 +598,6 @@ def extrair_dados_steamrip(url_alvo):
 
 
 def salvar_jogo_firebase(dados_novos):
-    """Salva ou atualiza /jogos/{id}.json no Firebase PC apenas se houver mudança real (ou FORCE_UPDATE)."""
     id_jogo = dados_novos["id"]
     if not dados_novos.get("links"):
         print(f"⚠️ Nenhum link de download válido encontrado para '{id_jogo}'. Nada enviado ao Firebase.")
@@ -611,7 +648,6 @@ def salvar_jogo_firebase(dados_novos):
 
 
 def registrar_na_lista(url_alvo):
-    """Salva a URL no jogos.txt para monitoramento automático futuro."""
     existentes = set()
     if os.path.exists(ARQUIVO_JOGOS):
         with open(ARQUIVO_JOGOS, "r", encoding="utf-8") as f:
