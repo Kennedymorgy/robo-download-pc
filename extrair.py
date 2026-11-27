@@ -254,7 +254,7 @@ def extrair_url_de_onclick(onclick_str, base_url):
 
 def resolver_clique_com_paciencia(context, page, selector_idx, url_base, urls_observadas_rede):
     """
-    Clica no botão/link e aguarda com calma (até ~18s) para capturar URL real
+    Clica no botão/link e aguarda com calma para capturar URL real
     em nova aba, redirecionamento ou tráfego de rede, fechando abas de anúncio.
     """
     try:
@@ -283,7 +283,6 @@ def resolver_clique_com_paciencia(context, page, selector_idx, url_base, urls_ob
         while time.time() < prazo:
             page.wait_for_timeout(1000)
 
-            # 1) Verifica abas novas abertas
             for p_extra in list(context.pages):
                 if p_extra not in antes_paginas and p_extra != page:
                     try:
@@ -293,7 +292,6 @@ def resolver_clique_com_paciencia(context, page, selector_idx, url_base, urls_ob
                     except Exception:
                         pass
                     try:
-                        # Fecha se não for o destino final desejado ou após capturar
                         if p_extra != page:
                             p_extra.close()
                     except Exception:
@@ -302,7 +300,6 @@ def resolver_clique_com_paciencia(context, page, selector_idx, url_base, urls_ob
             if candidata_final:
                 break
 
-            # 2) Verifica se a própria página navegou para link válido
             try:
                 if page.url and page.url != url_antes and parece_url_arquivo_valida(page.url):
                     candidata_final = page.url
@@ -310,7 +307,6 @@ def resolver_clique_com_paciencia(context, page, selector_idx, url_base, urls_ob
             except Exception:
                 pass
 
-            # 3) Verifica URLs observadas na rede após o clique
             for u_net in urls_observadas_rede[inicio_rede:]:
                 if parece_url_arquivo_valida(u_net):
                     candidata_final = u_net
@@ -319,12 +315,8 @@ def resolver_clique_com_paciencia(context, page, selector_idx, url_base, urls_ob
             if candidata_final:
                 break
 
-        # Se a aba principal mudou para um host externo, volta para a página do jogo para continuar nos próximos botões
         try:
-            if page.url != url_antes and url_base in page.url or (page.url != url_antes and not candidata_final):
-                page.goto(url_base, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(2000)
-            elif page.url != url_antes and candidata_final:
+            if page.url != url_antes:
                 page.goto(url_base, wait_until="domcontentloaded", timeout=30000)
                 page.wait_for_timeout(2000)
         except Exception:
@@ -373,7 +365,7 @@ def extrair_dados_steamrip(url_alvo):
             ),
             viewport={"width": 1366, "height": 768},
             locale="en-US",
-            referer=url_alvo,
+            extra_http_headers={"Referer": url_alvo},
         )
 
         page = context.new_page()
@@ -650,7 +642,6 @@ if __name__ == "__main__":
         FORCE_UPDATE = True
 
     if args and args[0].strip().startswith("http"):
-        # Em execução manual com URL específica, força regravação para atualizar qualquer link/campo
         if "--no-force" not in sys.argv[1:]:
             FORCE_UPDATE = True
         processar_url(args[0].strip())
