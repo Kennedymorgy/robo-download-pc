@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import json
+import time
 from urllib.parse import urlparse, urljoin
 import firebase_admin
 from firebase_admin import credentials, db
@@ -166,14 +167,20 @@ def identificar_nome_host(url, rotulo_proximo=""):
 
 def parece_url_arquivo_valida(url, rotulo=""):
     """
-    Verifica se a URL parece um destino real de arquivo/mirror/torrent
-    e não uma página inicial, erro ou anúncio.
+    Valida se a URL é um destino real de arquivo/mirror/torrent
+    e rejeita páginas de erro, bloqueio de referrer ou raiz de site.
     """
     if not url or not url.startswith(("http://", "https://", "magnet:")):
         return False
 
     u = url.lower()
-    if "/error" in u or "referrer+not+allowed" in u or "not+found" in u or "void" in u:
+    if (
+        "/error" in u
+        or "referrer" in u
+        or "not+found" in u
+        or "not-found" in u
+        or "void" in u
+    ):
         return False
 
     ignorar = [
@@ -202,7 +209,6 @@ def parece_url_arquivo_valida(url, rotulo=""):
 
     parsed = urlparse(url)
     caminho = (parsed.path or "").strip("/")
-    # Evita cair apenas na raiz do domínio (ex.: https://bzzhr.to/ ou https://megadb.net/)
     if not caminho and not parsed.query:
         return False
 
@@ -233,7 +239,11 @@ def extrair_url_de_onclick(onclick_str, base_url):
     """Extrai URL de dentro de atributos onclick como window.open('https://...') ou location.href='...'."""
     if not onclick_str:
         return ""
-    m = re.search(r"""(?:window\.open|location\.href|location\.assign|open)\s*\(\s*['"]([^'"]+)['"]""", onclick_str, flags=re.IGNORECASE)
+    m = re.search(
+        r"""(?:window\.open|location\.href|location\.assign|open)\s*\(\s*['"]([^'"]+)['"]""",
+        onclick_str,
+        flags=re.IGNORECASE,
+    )
     if m:
         return urljoin(base_url, m.group(1).strip())
     m2 = re.search(r"""https?://[^\s'"]+""", onclick_str, flags=re.IGNORECASE)
@@ -242,10 +252,10 @@ def extrair_url_de_onclick(onclick_str, base_url):
     return ""
 
 
-def resolver_clique_elemento(context, page, selector_idx, url_base):
+def resolver_clique_com_paciencia(context, page, selector_idx, url_base, urls_observadas_rede):
     """
-    Clica no elemento candidato para capturar URL aberta em nova aba (popup)
-    ou navegação, fechando abas de anúncio que não sejam hosts válidos.
+    Clica no botão/link e aguarda com calma (até ~18s) para capturar URL real
+    em nova aba, redirecionamento ou tráfego de rede, fechando abas de anúncio.
     """
     try:
         itens = page.locator("article a, article button, .entry-content a, .entry-content button, main a, main button")
@@ -255,63 +265,78 @@ def resolver_clique_elemento(context, page, selector_idx, url_base):
         el = itens.nth(selector_idx)
         antes_paginas = list(context.pages)
         url_antes = page.url
+        inicio_rede = len(urls_observadas_rede)
 
-        popup_url = ""
         try:
-            with context.expect_page(timeout=3500) as popup_info:
-                el.click(timeout=4000)
-            nova_aba = popup_info.value
-            try:
-                nova_aba.wait_for_load_state("domcontentloaded", timeout=6000)
-                popup_url = nova_aba.url or ""
-            except Exception:
-                popup_url = nova_aba.url or ""
-            finally:
-                try:
-                    if nova_aba != page:
-                        nova_aba.close()
-                except Exception:
-                    pass
+            el.scroll_into_view_if_needed(timeout=4000)
         except Exception:
+            pass
+
+        try:
+            el.click(timeout=5000)
+        except Exception:
+            return ""
+
+        candidata_final = ""
+        prazo = time.time() + 16.0
+
+        while time.time() < prazo:
+            page.wait_for_timeout(1000)
+
+            # 1) Verifica abas novas abertas
+            for p_extra in list(context.pages):
+                if p_extra not in antes_paginas and p_extra != page:
+                    try:
+                        u_aba = p_extra.url or ""
+                        if parece_url_arquivo_valida(u_aba):
+                            candidata_final = u_aba
+                    except Exception:
+                        pass
+                    try:
+                        # Fecha se não for o destino final desejado ou após capturar
+                        if p_extra != page:
+                            p_extra.close()
+                    except Exception:
+                        pass
+
+            if candidata_final:
+                break
+
+            # 2) Verifica se a própria página navegou para link válido
             try:
-                el.click(timeout=4000)
-                page.wait_for_timeout(1500)
+                if page.url and page.url != url_antes and parece_url_arquivo_valida(page.url):
+                    candidata_final = page.url
+                    break
             except Exception:
                 pass
 
-        # Fecha quaisquer outras abas extras abertas por scripts/anúncios
-        for p_extra in list(context.pages):
-            if p_extra not in antes_paginas and p_extra != page:
-                try:
-                    if not popup_url and p_extra.url:
-                        popup_url = p_extra.url
-                except Exception:
-                    pass
-                try:
-                    p_extra.close()
-                except Exception:
-                    pass
+            # 3) Verifica URLs observadas na rede após o clique
+            for u_net in urls_observadas_rede[inicio_rede:]:
+                if parece_url_arquivo_valida(u_net):
+                    candidata_final = u_net
+                    break
 
-        if popup_url and parece_url_arquivo_valida(popup_url):
-            return popup_url
+            if candidata_final:
+                break
 
-        if page.url and page.url != url_antes and parece_url_arquivo_valida(page.url):
-            destino_final = page.url
-            try:
-                page.go_back(wait_until="domcontentloaded", timeout=8000)
-                page.wait_for_timeout(1200)
-            except Exception:
-                pass
-            return destino_final
+        # Se a aba principal mudou para um host externo, volta para a página do jogo para continuar nos próximos botões
+        try:
+            if page.url != url_antes and url_base in page.url or (page.url != url_antes and not candidata_final):
+                page.goto(url_base, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
+            elif page.url != url_antes and candidata_final:
+                page.goto(url_base, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
+        except Exception:
+            pass
 
+        return candidata_final
     except Exception:
-        pass
-
-    return ""
+        return ""
 
 
 def extrair_dados_steamrip(url_alvo):
-    """Abre a página no SteamRIP e extrai metadados e links válidos de download."""
+    """Abre a página no SteamRIP com paciência e extrai metadados e links válidos."""
     print(f"🔎 Extraindo SteamRIP: {url_alvo}")
     id_jogo = gerar_id_jogo(url_alvo)
     nome_padrao = id_jogo.replace("-", " ").title()
@@ -326,6 +351,8 @@ def extrair_dados_steamrip(url_alvo):
         "foto": "",
         "links": {},
     }
+
+    urls_observadas_rede = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -346,6 +373,7 @@ def extrair_dados_steamrip(url_alvo):
             ),
             viewport={"width": 1366, "height": 768},
             locale="en-US",
+            referer=url_alvo,
         )
 
         page = context.new_page()
@@ -356,9 +384,19 @@ def extrair_dados_steamrip(url_alvo):
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
             )
 
+        def ao_requisitar(req):
+            try:
+                u = req.url or ""
+                if parece_url_arquivo_valida(u):
+                    urls_observadas_rede.append(u)
+            except Exception:
+                pass
+
+        page.on("request", ao_requisitar)
+
         try:
-            page.goto(url_alvo, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(4500)
+            page.goto(url_alvo, wait_until="domcontentloaded", timeout=90000)
+            page.wait_for_timeout(6000)
 
             titulo_completo = ""
             try:
@@ -488,16 +526,24 @@ def extrair_dados_steamrip(url_alvo):
 
                 rotulo = item.get("rotulo") or ""
                 texto_bot = (item.get("textoProprio") or "").lower()
-                raw_cand = item.get("href") or item.get("dataHref") or extrair_url_de_onclick(item.get("onclick") or "", url_alvo)
+                raw_cand = (
+                    item.get("href")
+                    or item.get("dataHref")
+                    or extrair_url_de_onclick(item.get("onclick") or "", url_alvo)
+                )
                 href_abs = urljoin(url_alvo, raw_cand) if raw_cand else ""
 
-                eh_botao_download = bool(re.search(r"\b(download\s*here|torrent|get\s*link)\b", f"{texto_bot} {rotulo}", flags=re.IGNORECASE))
+                eh_botao_download = bool(
+                    re.search(r"\b(download\s*here|torrent|get\s*link)\b", f"{texto_bot} {rotulo}", flags=re.IGNORECASE)
+                )
 
                 destino = ""
                 if href_abs and parece_url_arquivo_valida(href_abs, rotulo):
                     destino = href_abs
                 elif eh_botao_download:
-                    destino = resolver_clique_elemento(context, page, item.get("idx", -1), url_alvo)
+                    destino = resolver_clique_com_paciencia(
+                        context, page, item.get("idx", -1), url_alvo, urls_observadas_rede
+                    )
 
                 if not destino or not parece_url_arquivo_valida(destino, rotulo):
                     continue
@@ -565,6 +611,7 @@ def salvar_jogo_firebase(dados_novos):
             f"Tamanho: {payload['tamanho'] or '-'} | "
             f"Links: {len(payload['links'])}"
         )
+        print("🔗 Links gravados:", json.dumps(payload["links"], indent=2, ensure_ascii=False))
         return True
     except Exception as e:
         print(f"❌ Erro ao salvar no Firebase: {e}")
@@ -603,6 +650,9 @@ if __name__ == "__main__":
         FORCE_UPDATE = True
 
     if args and args[0].strip().startswith("http"):
+        # Em execução manual com URL específica, força regravação para atualizar qualquer link/campo
+        if "--no-force" not in sys.argv[1:]:
+            FORCE_UPDATE = True
         processar_url(args[0].strip())
     elif os.path.exists(ARQUIVO_JOGOS):
         with open(ARQUIVO_JOGOS, "r", encoding="utf-8") as f:
