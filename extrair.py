@@ -43,15 +43,8 @@ def gerar_id_jogo(url_origem):
 
 
 def extrair_versao_exata(titulo_completo, texto_corpo):
-    """
-    Busca a versão de forma confiável:
-    1) Linhas explícitas com 'Version: v...'
-    2) Título principal do jogo
-    3) Fallback controlado no texto do post
-    """
-    candidatos_texto = [texto_corpo or "", titulo_completo or ""]
-
-    for fonte in candidatos_texto:
+    """Extrai a versão principal do jogo priorizando o campo Version: da página."""
+    for fonte in [texto_corpo or "", titulo_completo or ""]:
         m_rotulo = re.search(
             r"(?:^|\n|\s)version\s*[:\-]\s*v?(\d+(?:\.\d+){1,4})",
             fonte,
@@ -129,10 +122,7 @@ def limpar_nome_jogo(titulo_raw):
 
 
 def identificar_nome_host(url, rotulo_proximo=""):
-    """
-    Define o nome real do host usando primeiro o domínio/URL real
-    e complementando com o rótulo exato daquele botão (ex.: Torrent).
-    """
+    """Identifica o nome real do host com base na URL e no rótulo do botão."""
     u = (url or "").lower()
     rot = (rotulo_proximo or "").strip()
 
@@ -174,11 +164,14 @@ def identificar_nome_host(url, rotulo_proximo=""):
 
 
 def url_e_host_de_download(url, rotulo=""):
-    """Valida se a URL é um destino real de download/espelho/torrent."""
+    """Filtra URLs válidas de download e descarta links quebrados, de erro ou anúncios."""
     if not url or not url.startswith(("http://", "https://", "magnet:")):
         return False
 
     u = url.lower()
+    if "/error" in u or "referrer+not+allowed" in u or "not+found" in u:
+        return False
+
     ignorar = [
         "steamrip.com",
         "discord.gg",
@@ -226,8 +219,64 @@ def url_e_host_de_download(url, rotulo=""):
     return any(h in u for h in hosts_conhecidos)
 
 
+def resolver_destino_real(context, page, url_candidata, indice_link):
+    """
+    Tenta resolver redirecionamentos ou clicar no botão correspondente para obter a URL final
+    sem cair em páginas de erro ou abas de anúncio.
+    """
+    url_limpa = (url_candidata or "").strip()
+    if not url_limpa:
+        return ""
+
+    # Se já for URL direta limpa de host conhecido e não tiver /error, mantém
+    if url_e_host_de_download(url_limpa) and "/error" not in url_limpa.lower():
+        return url_limpa
+
+    # Tenta clicar no botão/link correspondente na página para ver se abre URL real ou nova aba
+    try:
+        anchors = page.locator("article a[href], .entry-content a[href], main a[href]")
+        total = anchors.count()
+        alvo_idx = None
+        for i in range(total):
+            h = (anchors.nth(i).get_attribute("href") or "").strip()
+            if h and urljoin(page.url, h) == url_limpa:
+                alvo_idx = i
+                break
+
+        if alvo_idx is not None:
+            antes_paginas = len(context.pages)
+            try:
+                anchors.nth(alvo_idx).click(timeout=4000)
+                page.wait_for_timeout(1500)
+            except Exception:
+                pass
+
+            # Fecha abas extras abertas (geralmente anúncios) e pega URL válida se houver
+            url_encontrada = ""
+            for p_extra in list(context.pages)[antes_paginas:]:
+                try:
+                    u_extra = p_extra.url or ""
+                    if url_e_host_de_download(u_extra) and "/error" not in u_extra.lower():
+                        url_encontrada = u_extra
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        if p_extra != page:
+                            p_extra.close()
+                    except Exception:
+                        pass
+
+            if url_encontrada:
+                return url_encontrada
+    except Exception:
+        pass
+
+    return url_limpa
+
+
 def extrair_dados_steamrip(url_alvo):
-    """Abre a página no SteamRIP e extrai metadados e links com seus nomes corretos."""
+    """Abre a página no SteamRIP e extrai metadados e links válidos."""
     print(f"🔎 Extraindo SteamRIP: {url_alvo}")
     id_jogo = gerar_id_jogo(url_alvo)
     nome_padrao = id_jogo.replace("-", " ").title()
@@ -343,7 +392,6 @@ def extrair_dados_steamrip(url_alvo):
             if foto_url:
                 resultado["foto"] = urljoin(url_alvo, foto_url)
 
-            # Pega cada link dentro do conteúdo principal junto com o título imediatamente acima dele
             candidatos = page.evaluate(
                 """() => {
                     const out = [];
@@ -404,14 +452,18 @@ def extrair_dados_steamrip(url_alvo):
                 if not url_e_host_de_download(href_abs, rotulo):
                     continue
 
-                nome_host = identificar_nome_host(href_abs, rotulo)
+                destino = resolver_destino_real(context, page, href_abs, idx_extra)
+                if not url_e_host_de_download(destino, rotulo):
+                    continue
+
+                nome_host = identificar_nome_host(destino, rotulo)
                 chave_base = re.sub(r"[^a-z0-9]+", "_", nome_host.lower()).strip("_") or f"link_{idx_extra}"
 
                 if chave_base not in links_dict:
-                    links_dict[chave_base] = href_abs
-                elif links_dict[chave_base] != href_abs:
+                    links_dict[chave_base] = destino
+                elif links_dict[chave_base] != destino:
                     idx_extra += 1
-                    links_dict[f"{chave_base}_{idx_extra}"] = href_abs
+                    links_dict[f"{chave_base}_{idx_extra}"] = destino
 
             resultado["links"] = links_dict
 
@@ -427,7 +479,7 @@ def salvar_jogo_firebase(dados_novos):
     """Salva ou atualiza /jogos/{id}.json no Firebase PC apenas se houver mudança real."""
     id_jogo = dados_novos["id"]
     if not dados_novos.get("links"):
-        print(f"⚠️ Nenhum link de download encontrado para '{id_jogo}'. Nada enviado ao Firebase.")
+        print(f"⚠️ Nenhum link de download válido encontrado para '{id_jogo}'. Nada enviado ao Firebase.")
         return False
 
     try:
