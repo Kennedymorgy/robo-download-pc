@@ -44,7 +44,7 @@ def gerar_id_jogo(url_origem):
 
 def separar_versao_e_extra(texto_raw):
     """
-    Separa a versão curta (ex.: v483.970) do extra/edição (ex.: + Multiplayer, + All DLCs).
+    Separa a versão curta (ex.: v1.5.0.0) do extra/edição (ex.: + Multiplayer, + All DLCs).
     """
     texto = (texto_raw or "").strip()
     versao = ""
@@ -57,11 +57,11 @@ def separar_versao_e_extra(texto_raw):
     padroes_extra = [
         r"\+\s*Multiplayer(?:\s*Fix)?",
         r"\+\s*Online(?:\s*Fix)?",
-        r"\+\s*All\s*DLCs?",
+        r"\+\s*All\s*(?:DLCs?|add-ons?)",
         r"\+\s*DLCs?",
         r"\+\s*Co-?op",
         r"Multiplayer(?:\s*Fix)?",
-        r"All\s*DLCs?",
+        r"All\s*(?:DLCs?|add-ons?)",
         r"Deluxe\s*Edition",
         r"Complete\s*Edition",
         r"Gold\s*Edition",
@@ -72,7 +72,7 @@ def separar_versao_e_extra(texto_raw):
         for achado in re.findall(pat, texto, flags=re.IGNORECASE):
             limpo = re.sub(r"\s+", " ", achado).strip()
             if limpo and not limpo.startswith("+") and any(
-                k in limpo.lower() for k in ("multiplayer", "dlc", "online", "co-op", "coop")
+                k in limpo.lower() for k in ("multiplayer", "dlc", "online", "co-op", "coop", "add-on")
             ):
                 limpo = "+ " + limpo
             if limpo.lower() not in [x.lower() for x in extras]:
@@ -80,6 +80,20 @@ def separar_versao_e_extra(texto_raw):
 
     extra_final = " ".join(extras).strip()
     return versao, extra_final
+
+
+def extrair_tamanho_jogo(texto_corpo):
+    """Extrai o peso/tamanho do jogo (ex.: 8.28 GB) a partir do texto da página."""
+    if not texto_corpo:
+        return ""
+    m = re.search(
+        r"(?:Game\s*Size|Tamanho|Size)\s*[:\-]\s*([0-9]+(?:[.,][0-9]+)?\s*(?:GB|MB|TB))",
+        texto_corpo,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return re.sub(r"\s+", " ", m.group(1)).replace(",", ".").strip()
+    return ""
 
 
 def limpar_nome_jogo(titulo_raw):
@@ -93,43 +107,46 @@ def limpar_nome_jogo(titulo_raw):
     return t
 
 
-def normalizar_nome_host(url_ou_texto, host_previo=""):
-    """Identifica o nome amigável do host (Gofile, Buzzheavier, Fileditch, etc.)."""
-    alvo = f"{host_previo} {url_ou_texto}".lower()
-    if "gofile" in alvo:
-        return "Gofile"
-    if "buzzheavier" in alvo or "bzzhr" in alvo:
-        return "Buzzheavier"
-    if "fileditch" in alvo:
-        return "Fileditch"
-    if "mediafire" in alvo:
-        return "MediaFire"
-    if "mega.nz" in alvo or "mega.io" in alvo:
-        return "Mega"
-    if "1fichier" in alvo:
-        return "1fichier"
-    if "pixeldrain" in alvo:
-        return "PixelDrain"
-    if "vikingfile" in alvo:
-        return "VikingFile"
-    if "datanodes" in alvo:
-        return "DataNodes"
-    if "torrent" in alvo or "magnet:" in alvo:
-        return "Torrent"
+def normalizar_nome_host(url_ou_texto, contexto_previo=""):
+    """Identifica o nome real do host (MegaDB, BZZHR/Buzzheavier, 1fichier, Torrent, etc.)."""
+    ctx = (contexto_previo or "").strip()
+    alvo = f"{ctx} {url_ou_texto}".lower()
 
-    if host_previo and host_previo.strip():
-        return host_previo.strip().title()
+    # Prioriza nomes explícitos visíveis no contexto do botão
+    for host_exato, rotulo in [
+        ("megadb", "MegaDB"),
+        ("buzzheavier", "Buzzheavier"),
+        ("bzzhr", "BZZHR"),
+        ("1fichier", "1fichier"),
+        ("gofile", "Gofile"),
+        ("mediafire", "MediaFire"),
+        ("fileditch", "Fileditch"),
+        ("pixeldrain", "PixelDrain"),
+        ("vikingfile", "VikingFile"),
+        ("datanodes", "DataNodes"),
+        ("mega.nz", "Mega"),
+        ("mega.io", "Mega"),
+        ("torrent", "Torrent"),
+    ]:
+        if host_exato in alvo:
+            return rotulo
+
+    if ctx:
+        palavras = re.sub(r"(?i)\b(download\s*here|download|link|mirror|click\s*here)\b", "", ctx).strip()
+        palavras = re.sub(r"\s+", " ", palavras).strip()
+        if palavras and len(palavras) <= 28:
+            return palavras
 
     try:
         dominio = urlparse(url_ou_texto).netloc.replace("www.", "")
-        parte = dominio.split(".")[0] if dominio else "Espelho"
-        return parte.capitalize() or "Espelho"
+        parte = dominio.split(".")[0] if dominio else "Mirror"
+        return parte.upper() if len(parte) <= 5 else parte.capitalize()
     except Exception:
-        return "Espelho"
+        return "Mirror"
 
 
-def url_e_host_de_download(url):
-    """Filtra URLs externas que parecem links de hospedagem/download e ignora lixo."""
+def url_e_host_de_download(url, contexto=""):
+    """Filtra URLs de download/espelho/torrent e ignora redes sociais/anúncios."""
     if not url or not url.startswith(("http://", "https://", "magnet:")):
         return False
 
@@ -151,12 +168,15 @@ def url_e_host_de_download(url):
         "instagram.com",
         "cdn-cgi",
         "javascript:",
-        "#",
     ]
     if any(bad in u for bad in ignorar):
         return False
 
+    if u.startswith("magnet:") or "torrent" in u or "torrent" in (contexto or "").lower():
+        return True
+
     hosts_conhecidos = [
+        "megadb",
         "gofile",
         "buzzheavier",
         "bzzhr",
@@ -171,18 +191,26 @@ def url_e_host_de_download(url):
         "qiwi",
         "akirabox",
         "modsfire",
+        "uploadhaven",
+        "ranoz",
+        "bowfile",
     ]
-    return any(h in u for h in hosts_conhecidos)
+    if any(h in u for h in hosts_conhecidos):
+        return True
+
+    # Aceita link externo se o texto/contexto indicar explicitamente download/mirror
+    return bool(re.search(r"\b(download\s*here|torrent|megadb|bzzhr|buzzheavier|1fichier|gofile|mediafire)\b", f"{contexto} {u}", flags=re.IGNORECASE))
 
 
 def extrair_dados_steamrip(url_alvo):
     """
     Abre a página no SteamRIP e extrai:
     - nome
-    - versao (curta)
-    - extra (ex.: + Multiplayer, + All DLCs)
-    - foto (capa/imagem do jogo)
-    - links (dicionário de espelhos válidos)
+    - versao
+    - extra
+    - tamanho
+    - foto
+    - links (até 6 espelhos/botões com nomes reais)
     """
     print(f"🔎 Extraindo SteamRIP: {url_alvo}")
     id_jogo = gerar_id_jogo(url_alvo)
@@ -194,6 +222,7 @@ def extrair_dados_steamrip(url_alvo):
         "nome": nome_padrao,
         "versao": "",
         "extra": "",
+        "tamanho": "",
         "foto": "",
         "links": {},
     }
@@ -250,13 +279,31 @@ def extrair_dados_steamrip(url_alvo):
             if not titulo_completo:
                 titulo_completo = (page.title() or "").strip()
 
+            texto_pagina = ""
+            try:
+                texto_pagina = page.evaluate(
+                    "() => (document.querySelector('article, .entry-content, main') || document.body).innerText || ''"
+                ) or ""
+            except Exception:
+                texto_pagina = ""
+
             nome_limpo = limpar_nome_jogo(titulo_completo)
             if nome_limpo:
                 resultado["nome"] = nome_limpo
 
-            versao, extra = separar_versao_e_extra(titulo_completo)
-            resultado["versao"] = versao
-            resultado["extra"] = extra
+            versao_tit, extra_tit = separar_versao_e_extra(titulo_completo)
+            versao_corpo, extra_corpo = separar_versao_e_extra(texto_pagina)
+
+            # Prioriza versão encontrada no corpo (ex.: Version: v1.5.0.0) se o título não tiver
+            resultado["versao"] = versao_corpo or versao_tit
+            extras_combinados = []
+            for item in (extra_corpo, extra_tit):
+                for parte in (item or "").split("+"):
+                    p_limpo = parte.strip()
+                    if p_limpo and p_limpo.lower() not in [x.lower() for x in extras_combinados]:
+                        extras_combinados.append("+ " + p_limpo if not p_limpo.startswith("+") else p_limpo)
+            resultado["extra"] = " ".join(extras_combinados).strip()
+            resultado["tamanho"] = extrair_tamanho_jogo(texto_pagina)
 
             foto_url = ""
             try:
@@ -288,24 +335,37 @@ def extrair_dados_steamrip(url_alvo):
             candidatos = page.evaluate(
                 """() => {
                     const out = [];
-                    const anchors = Array.from(document.querySelectorAll('a[href]'));
+                    const root = document.querySelector('article, .entry-content, main') || document.body;
+                    const anchors = Array.from(root.querySelectorAll('a[href]'));
                     for (const a of anchors) {
                         const href = (a.getAttribute('href') || '').trim();
                         if (!href || href.startsWith('#') || href.toLowerCase().startsWith('javascript:')) continue;
 
-                        let contexto = (a.innerText || a.textContent || '').trim();
+                        const ownText = (a.innerText || a.textContent || '').trim();
+                        let prevText = '';
                         const prev = a.previousElementSibling;
-                        if (prev) {
-                            contexto += ' ' + (prev.innerText || prev.textContent || '').trim();
-                        }
+                        if (prev) prevText = (prev.innerText || prev.textContent || '').trim();
+
+                        let parentPrevText = '';
                         const parent = a.parentElement;
-                        if (parent && parent.previousElementSibling) {
-                            contexto += ' ' + (parent.previousElementSibling.innerText || parent.previousElementSibling.textContent || '').trim();
+                        if (parent) {
+                            const pPrev = parent.previousElementSibling;
+                            if (pPrev) parentPrevText = (pPrev.innerText || pPrev.textContent || '').trim();
+                            const pText = (parent.innerText || parent.textContent || '').trim();
+                            if (!prevText && pText && pText !== ownText) {
+                                prevText = pText.replace(ownText, '').trim();
+                            }
                         }
+
+                        const contexto = [parentPrevText, prevText, ownText]
+                            .filter(Boolean)
+                            .join(' ')
+                            .replace(/\\s+/g, ' ')
+                            .trim();
 
                         out.push({
                             href: href,
-                            contexto: contexto.replace(/\\s+/g, ' ').trim()
+                            contexto: contexto
                         });
                     }
                     return out;
@@ -313,24 +373,29 @@ def extrair_dados_steamrip(url_alvo):
             )
 
             links_dict = {}
-            contador_generico = 1
+            contador = 1
 
             for item in candidatos:
+                if len(links_dict) >= 6:
+                    break
+
                 href_abs = urljoin(url_alvo, item.get("href") or "")
                 ctx = item.get("contexto") or ""
 
-                if not url_e_host_de_download(href_abs):
+                if not url_e_host_de_download(href_abs, ctx):
                     continue
 
                 nome_host = normalizar_nome_host(href_abs, ctx)
-                chave = re.sub(r"[^a-z0-9]+", "_", nome_host.lower()).strip("_") or f"mirror_{contador_generico}"
+                chave_base = re.sub(r"[^a-z0-9]+", "_", nome_host.lower()).strip("_") or f"mirror_{contador}"
 
+                chave = chave_base
                 if chave in links_dict and links_dict[chave] != href_abs:
-                    contador_generico += 1
-                    chave = f"{chave}_{contador_generico}"
+                    contador += 1
+                    chave = f"{chave_base}_{contador}"
 
                 if chave not in links_dict:
                     links_dict[chave] = href_abs
+                    contador += 1
 
             resultado["links"] = links_dict
 
@@ -358,10 +423,11 @@ def salvar_jogo_firebase(dados_novos):
         mesmo_nome = atual.get("nome") == dados_novos.get("nome")
         mesma_versao = atual.get("versao") == dados_novos.get("versao")
         mesmo_extra = atual.get("extra") == dados_novos.get("extra")
+        mesmo_tamanho = atual.get("tamanho") == dados_novos.get("tamanho")
         mesma_foto = atual.get("foto") == dados_novos.get("foto")
         mesmos_links = atual.get("links") == dados_novos.get("links")
 
-        if mesmo_nome and mesma_versao and mesmo_extra and mesma_foto and mesmos_links:
+        if mesmo_nome and mesma_versao and mesmo_extra and mesmo_tamanho and mesma_foto and mesmos_links:
             print(f"⏩ '{id_jogo}' sem alterações ({dados_novos.get('versao') or 'sem versão'}).")
             return True
 
@@ -370,6 +436,7 @@ def salvar_jogo_firebase(dados_novos):
             "nome": dados_novos["nome"],
             "versao": dados_novos["versao"],
             "extra": dados_novos["extra"],
+            "tamanho": dados_novos["tamanho"],
             "foto": dados_novos["foto"],
             "links": dados_novos["links"],
             "url_origem": dados_novos["url_origem"],
@@ -381,6 +448,7 @@ def salvar_jogo_firebase(dados_novos):
             f"✅ Firebase PC atualizado -> ID: {id_jogo} | "
             f"Versão: {payload['versao'] or '-'} | "
             f"Extra: {payload['extra'] or '-'} | "
+            f"Tamanho: {payload['tamanho'] or '-'} | "
             f"Links: {len(payload['links'])}"
         )
         return True
