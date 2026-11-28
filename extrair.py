@@ -575,7 +575,6 @@ def salvar_jogo_firebase(dados_novos):
         if not isinstance(atual, dict):
             atual = {}
 
-        # Verifica especificamente se links, versão ou extra mudaram (e demais campos principais)
         mudou_links = (atual.get("links") or {}) != (dados_novos.get("links") or {})
         mudou_versao = (atual.get("versao") or "") != (dados_novos.get("versao") or "")
         mudou_extra = (atual.get("extra") or "") != (dados_novos.get("extra") or "")
@@ -664,13 +663,13 @@ def processar_url(url_alvo):
 
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if a != "--force"]
+    args = [a for a in sys.argv[1:] if a not in ("--force", "--no-force")]
     if "--force" in sys.argv[1:]:
         FORCE_UPDATE = True
+    elif "--no-force" in sys.argv[1:]:
+        FORCE_UPDATE = False
 
     if args and args[0].strip().startswith("http"):
-        if "--no-force" not in sys.argv[1:]:
-            FORCE_UPDATE = True
         processar_url(args[0].strip())
     elif os.path.exists(ARQUIVO_JOGOS):
         with open(ARQUIVO_JOGOS, "r", encoding="utf-8") as f:
