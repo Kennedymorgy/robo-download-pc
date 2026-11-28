@@ -21,6 +21,12 @@ FIREBASE_CREDENTIALS_JSON = os.environ.get("FIREBASE_CREDENTIALS_JSON")
 FORCE_UPDATE = os.environ.get("FORCE_UPDATE", "").strip().lower() in ("1", "true", "yes")
 ARQUIVO_JOGOS = "jogos.txt"
 
+# Hosts bloqueados que dão erro de referrer ou redirecionamento indevido
+HOSTS_BLOQUEADOS = ("megadb", "buzzheavier", "bzzhr", "fileditch")
+
+# Hosts alternativos rápidos aceitos para o fluxo SteamRIP
+HOSTS_ACEITOS = ("gofile", "pixeldrain", "1fichier")
+
 
 def obter_ref_firebase(id_jogo):
     if not FIREBASE_CREDENTIALS_JSON:
@@ -121,28 +127,12 @@ def identificar_nome_host(url, rotulo_proximo=""):
     u = (url or "").lower()
     rot = (rotulo_proximo or "").strip()
 
-    if "torrent" in rot.lower() or u.startswith("magnet:") or "torrent" in u:
-        return "Torrent"
-    if "1fichier" in u:
-        return "1fichier"
-    if "megadb" in u:
-        return "MegaDB"
-    if "buzzheavier" in u or "bzzhr" in u:
-        return "Buzzheavier"
     if "gofile" in u:
         return "Gofile"
-    if "mediafire" in u:
-        return "MediaFire"
-    if "fileditch" in u:
-        return "Fileditch"
     if "pixeldrain" in u:
         return "PixelDrain"
-    if "vikingfile" in u:
-        return "VikingFile"
-    if "datanodes" in u:
-        return "DataNodes"
-    if "mega.nz" in u or "mega.io" in u:
-        return "Mega"
+    if "1fichier" in u:
+        return "1fichier"
 
     if rot:
         limpo = re.sub(r"(?i)\b(download\s*here|download|click\s*here|link|mirror)\b", "", rot).strip()
@@ -159,10 +149,13 @@ def identificar_nome_host(url, rotulo_proximo=""):
 
 
 def parece_url_arquivo_valida(url, rotulo=""):
-    if not url or not url.startswith(("http://", "https://", "magnet:")):
+    if not url or not url.startswith(("http://", "https://")):
         return False
 
     u = url.lower()
+    if any(bad in u for bad in HOSTS_BLOQUEADOS):
+        return False
+
     if (
         "/error" in u
         or "referrer" in u
@@ -193,35 +186,12 @@ def parece_url_arquivo_valida(url, rotulo=""):
     if any(bad in u for bad in ignorar):
         return False
 
-    if u.startswith("magnet:") or "torrent" in u or "torrent" in (rotulo or "").lower():
-        return True
-
     parsed = urlparse(url)
     caminho = (parsed.path or "").strip("/")
     if not caminho and not parsed.query:
         return False
 
-    hosts_conhecidos = [
-        "megadb",
-        "gofile",
-        "buzzheavier",
-        "bzzhr",
-        "fileditch",
-        "mediafire",
-        "mega.nz",
-        "mega.io",
-        "1fichier",
-        "pixeldrain",
-        "vikingfile",
-        "datanodes",
-        "qiwi",
-        "akirabox",
-        "modsfire",
-        "uploadhaven",
-        "ranoz",
-        "bowfile",
-    ]
-    return any(h in u for h in hosts_conhecidos)
+    return any(h in u for h in HOSTS_ACEITOS)
 
 
 def extrair_url_de_onclick(onclick_str, base_url):
@@ -241,10 +211,6 @@ def extrair_url_de_onclick(onclick_str, base_url):
 
 
 def seguir_redirecionamento_real(context, page, url_inicial, url_base):
-    """
-    Abre a URL candidata num contexto com Referer do SteamRIP, espera redirecionamentos
-    e anúncios/popups, e devolve a URL final limpa do host de download (ou vazio se falhar).
-    """
     if not url_inicial or not parece_url_arquivo_valida(url_inicial):
         return ""
 
@@ -253,13 +219,13 @@ def seguir_redirecionamento_real(context, page, url_inicial, url_base):
     try:
         aba_teste = context.new_page()
         aba_teste.set_extra_http_headers({"Referer": url_base})
-        aba_teste.goto(url_inicial, wait_until="domcontentloaded", timeout=35000)
+        aba_teste.goto(url_inicial, wait_until="domcontentloaded", timeout=30000)
 
         melhor_url = aba_teste.url or url_inicial
-        prazo = time.time() + 14.0
+        prazo = time.time() + 10.0
 
         while time.time() < prazo:
-            aba_teste.wait_for_timeout(1000)
+            aba_teste.wait_for_timeout(800)
 
             for p_extra in list(context.pages):
                 if p_extra not in antes_paginas and p_extra != aba_teste and p_extra != page:
@@ -317,10 +283,10 @@ def resolver_clique_elemento(context, page, selector_idx, url_base, urls_observa
             return ""
 
         candidata = ""
-        prazo = time.time() + 15.0
+        prazo = time.time() + 12.0
 
         while time.time() < prazo:
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(800)
 
             for p_extra in list(context.pages):
                 if p_extra not in antes_paginas and p_extra != page:
@@ -356,8 +322,8 @@ def resolver_clique_elemento(context, page, selector_idx, url_base, urls_observa
 
         try:
             if page.url != url_antes:
-                page.goto(url_base, wait_until="domcontentloaded", timeout=35000)
-                page.wait_for_timeout(2000)
+                page.goto(url_base, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(1500)
         except Exception:
             pass
 
@@ -426,7 +392,7 @@ def extrair_dados_steamrip(url_alvo):
 
         try:
             page.goto(url_alvo, wait_until="domcontentloaded", timeout=90000)
-            page.wait_for_timeout(6000)
+            page.wait_for_timeout(5000)
 
             titulo_completo = ""
             try:
@@ -551,7 +517,7 @@ def extrair_dados_steamrip(url_alvo):
             idx_extra = 1
 
             for item in candidatos:
-                if len(links_dict) >= 6:
+                if len(links_dict) >= 4:
                     break
 
                 rotulo = item.get("rotulo") or ""
@@ -564,7 +530,7 @@ def extrair_dados_steamrip(url_alvo):
                 href_abs = urljoin(url_alvo, raw_cand) if raw_cand else ""
 
                 eh_botao_download = bool(
-                    re.search(r"\b(download\s*here|torrent|get\s*link)\b", f"{texto_bot} {rotulo}", flags=re.IGNORECASE)
+                    re.search(r"\b(download\s*here|get\s*link)\b", f"{texto_bot} {rotulo}", flags=re.IGNORECASE)
                 )
 
                 destino = ""
@@ -600,7 +566,7 @@ def extrair_dados_steamrip(url_alvo):
 def salvar_jogo_firebase(dados_novos):
     id_jogo = dados_novos["id"]
     if not dados_novos.get("links"):
-        print(f"⚠️ Nenhum link de download válido encontrado para '{id_jogo}'. Nada enviado ao Firebase.")
+        print(f"⚠️ Nenhum link aceito (gofile/pixeldrain/1fichier) encontrado para '{id_jogo}'. Nada enviado ao Firebase.")
         return False
 
     try:
@@ -609,16 +575,41 @@ def salvar_jogo_firebase(dados_novos):
         if not isinstance(atual, dict):
             atual = {}
 
-        mesmo_nome = atual.get("nome") == dados_novos.get("nome")
-        mesma_versao = atual.get("versao") == dados_novos.get("versao")
-        mesmo_extra = atual.get("extra") == dados_novos.get("extra")
-        mesmo_tamanho = atual.get("tamanho") == dados_novos.get("tamanho")
-        mesma_foto = atual.get("foto") == dados_novos.get("foto")
-        mesmos_links = atual.get("links") == dados_novos.get("links")
+        # Verifica especificamente se links, versão ou extra mudaram (e demais campos principais)
+        mudou_links = (atual.get("links") or {}) != (dados_novos.get("links") or {})
+        mudou_versao = (atual.get("versao") or "") != (dados_novos.get("versao") or "")
+        mudou_extra = (atual.get("extra") or "") != (dados_novos.get("extra") or "")
+        mudou_nome = (atual.get("nome") or "") != (dados_novos.get("nome") or "")
+        mudou_tamanho = (atual.get("tamanho") or "") != (dados_novos.get("tamanho") or "")
+        mudou_foto = (atual.get("foto") or "") != (dados_novos.get("foto") or "")
 
-        if not FORCE_UPDATE and mesmo_nome and mesma_versao and mesmo_extra and mesmo_tamanho and mesma_foto and mesmos_links:
-            print(f"⏩ '{id_jogo}' sem alterações ({dados_novos.get('versao') or 'sem versão'}).")
+        if not FORCE_UPDATE and not any((
+            mudou_links,
+            mudou_versao,
+            mudou_extra,
+            mudou_nome,
+            mudou_tamanho,
+            mudou_foto,
+        )):
+            print(
+                f"⏩ '{id_jogo}' sem alterações em links, versão ou extra "
+                f"({dados_novos.get('versao') or 'sem versão'}). Ignorado."
+            )
             return True
+
+        motivos = []
+        if mudou_links:
+            motivos.append("links")
+        if mudou_versao:
+            motivos.append("versão")
+        if mudou_extra:
+            motivos.append("extra")
+        if mudou_nome:
+            motivos.append("nome")
+        if mudou_tamanho:
+            motivos.append("tamanho")
+        if mudou_foto:
+            motivos.append("foto")
 
         payload = {
             "id": id_jogo,
@@ -634,7 +625,7 @@ def salvar_jogo_firebase(dados_novos):
 
         ref.set(payload)
         print(
-            f"✅ Firebase PC atualizado -> ID: {id_jogo} | "
+            f"✅ Firebase PC atualizado [{', '.join(motivos) or 'forçado'}] -> ID: {id_jogo} | "
             f"Versão: {payload['versao'] or '-'} | "
             f"Extra: {payload['extra'] or '-'} | "
             f"Tamanho: {payload['tamanho'] or '-'} | "
