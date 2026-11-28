@@ -1,51 +1,60 @@
-name: Executar Robô PC (Firebase)
+name: extrair
 
 on:
   schedule:
-    - cron: '0 3,15 * * *'
+    - cron: "0 8,20 * * *"
   workflow_dispatch:
     inputs:
-      url_manual:
-        description: 'URL do jogo no SteamRIP para testar ou adicionar'
+      url:
+        description: "URL específica do jogo (opcional)"
         required: false
-        default: ''
+        default: ""
+      force:
+        description: "Forçar atualização mesmo sem mudança (true/false)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: write
 
 jobs:
   extrair:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
     steps:
-      - name: Baixar codigo do repositorio
-        uses: actions/checkout@v3
+      - name: Baixar código do repositório
+        uses: actions/checkout@v4
 
       - name: Configurar Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.11"
 
-      - name: Instalar dependencias
+      - name: Instalar dependências
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install firebase-admin playwright playwright-stealth
           playwright install chromium
 
-      - name: Executar robo PC
+      - name: Executar robô PC
         env:
-          FIREBASE_DB_URL: https://k404repacks-pc-default-rtdb.firebaseio.com
+          FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
           FIREBASE_CREDENTIALS_JSON: ${{ secrets.FIREBASE_CREDENTIALS_JSON }}
+          FORCE_UPDATE: ${{ inputs.force }}
         run: |
-          if [ -n "${{ github.event.inputs.url_manual }}" ]; then
-            python extrair.py "${{ github.event.inputs.url_manual }}"
+          if [ -n "${{ inputs.url }}" ]; then
+            python extrair.py "${{ inputs.url }}"
           else
             python extrair.py
           fi
 
-      - name: Salvar lista de jogos no repositorio
+      - name: Salvar lista de jogos no repositório
         run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add jogos.txt || true
-          git commit -m "Auto: Lista de jogos PC atualizada" || exit 0
-          git push
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git status --porcelain | grep -q "jogos.txt"; then
+            git add jogos.txt
+            git commit -m "Atualiza lista jogos.txt"
+            git push
+          else
+            echo "Nenhuma alteração em jogos.txt"
+          fi
