@@ -1,4 +1,4 @@
-name: extrair
+name: Robo SteamRIP
 
 on:
   schedule:
@@ -9,10 +9,14 @@ on:
         description: "URL específica do jogo (opcional)"
         required: false
         default: ""
-      force:
-        description: "Forçar atualização mesmo sem mudança (true/false)"
-        required: false
-        default: "false"
+      modo:
+        description: "Modo de execução"
+        type: choice
+        required: true
+        default: "automatico"
+        options:
+          - automatico
+          - atualizar
 
 permissions:
   contents: write
@@ -39,7 +43,7 @@ jobs:
         env:
           FIREBASE_DB_URL: ${{ secrets.FIREBASE_DB_URL }}
           FIREBASE_CREDENTIALS_JSON: ${{ secrets.FIREBASE_CREDENTIALS_JSON }}
-          FORCE_UPDATE: ${{ inputs.force }}
+          FORCE_UPDATE: ${{ inputs.modo == 'atualizar' && 'true' || 'false' }}
         run: |
           if [ -n "${{ inputs.url }}" ]; then
             python extrair.py "${{ inputs.url }}"
